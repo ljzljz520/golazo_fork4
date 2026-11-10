@@ -88,11 +88,17 @@ func (c *Client) LiveAndUpcomingForLeague(ctx context.Context, leagueID int) (li
 	live, upcoming = classifyLeagueMatches(leagueResponse.Fixtures.AllMatches, leagueInfo, time.Now())
 
 	for _, m := range live {
-		c.StorePageURL(m.ID, m.PageURL)
+		c.StorePageURL(m.ID, m.League.ID, m.PageURL)
 	}
 	for _, m := range upcoming {
-		c.StorePageURL(m.ID, m.PageURL)
+		c.StorePageURL(m.ID, m.League.ID, m.PageURL)
 	}
+
+	// Persist locations for later independent `match` processes. The
+	// LiveAndUpcoming aggregator loops over this method per league; each
+	// invocation writes its own batch, and Upsert's reload-merge keeps the
+	// batches from overwriting one another.
+	c.PersistMatchLocations(append(live, upcoming...))
 
 	if c.logger != nil {
 		c.debugLog("live: classified league fixtures",
@@ -192,11 +198,11 @@ func (p *LiveUpdateParser) ParseEvents(events []api.MatchEvent, homeTeam, awayTe
 
 // Event type prefixes for visual identification (used by UI for coloring)
 const (
-	EventPrefixGoal        = "●" // Solid circle - goals (red)
-	EventPrefixYellowCard  = "▪" // Square - yellow card (cyan)
-	EventPrefixRedCard     = "■" // Filled square - red card (red)
+	EventPrefixGoal         = "●" // Solid circle - goals (red)
+	EventPrefixYellowCard   = "▪" // Square - yellow card (cyan)
+	EventPrefixRedCard      = "■" // Filled square - red card (red)
 	EventPrefixSubstitution = "↔" // Arrow - substitution (dim)
-	EventPrefixOther       = "·" // Small dot - other events (dim)
+	EventPrefixOther        = "·" // Small dot - other events (dim)
 )
 
 // formatEvent formats a single event into a readable string with symbol prefix and label.

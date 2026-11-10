@@ -71,17 +71,27 @@ func runMatch(stdout, stderr io.Writer, flags cliFlags, args []string) int {
 }
 
 var matchCmd = &cobra.Command{
-	Use:           "match <id>",
-	Short:         "Get match details as JSON (best-effort; see notes)",
+	Use:   "match <id>",
+	Short: "Get match details as JSON",
 	Long: `Fetches detailed information (events, lineups, stats, formations) for a single match by ID.
 
-LIMITATION: This subcommand is BEST-EFFORT only. FotMob's match-details endpoint is gated behind Cloudflare and requires a page slug that this CLI cannot reliably obtain in a one-shot invocation. Cold calls with arbitrary IDs typically return upstream_error (HTTP 404), even for valid IDs returned by 'live' or 'finished' in a separate process.
+Location contract across processes:
+  'live' and 'finished' persist every discovered match's ID, league, and page
+  path to a bounded on-disk index (match-locations.json in the config dir).
+  A later, independent 'match' invocation reads that index on cold start and
+  fetches the match page directly — no in-process slug cache is required.
+
+  If the stored page path has gone stale, the client re-fetches the known
+  league page, recovers the match's current page path, repairs the index, and
+  retries. Returned details are identity-checked against the requested match
+  ID; error pages or wrong-match pages are never cached. Arbitrary IDs that
+  were never discovered by a list command still rely on the legacy API
+  fallback and may return upstream_error.
 
 Reliable usage:
+  - Discover IDs with 'golazo live' or 'golazo finished', then call 'golazo match <id>'
   - With --mock: works against bundled mock IDs (e.g. 2001, 2002)
   - From inside the TUI: 'golazo' (interactive) reliably loads match details
-
-Not recommended for production agent pipelines. Agents that need event-level data should rely on the 'live' and 'finished' subcommands, which return match metadata, scores, status, and round info without this constraint.
 
 Example (mock):
   golazo match 2001 --mock

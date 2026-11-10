@@ -36,11 +36,12 @@ type Client struct {
 	baseURL       string
 	rateLimiter   *ratelimit.Limiter
 	cache         *ResponseCache
-	emptyCache    *EmptyResultsCache // Persistent cache for empty league+date combinations
-	pageURLs      map[int]string     // Match ID -> page slug mapping for page-based fetching
+	emptyCache    *EmptyResultsCache    // Persistent cache for empty league+date combinations
+	pageURLs      map[int]LocationEntry // In-process match ID -> location (slug + league)
 	pageURLsMu    sync.RWMutex
-	maxConcurrent chan struct{} // Semaphore to limit concurrent API requests
-	logger        *slog.Logger // Optional debug logger (no-op if nil)
+	locationIndex *LocationIndex // Persistent cross-process match location index (nil if unusable)
+	maxConcurrent chan struct{}  // Semaphore to limit concurrent API requests
+	logger        *slog.Logger   // Optional debug logger (no-op if nil)
 }
 
 // NewClient creates a new FotMob API client with default configuration.
@@ -53,6 +54,15 @@ func NewClient() *Client {
 	if err != nil {
 		// If we can't create the cache, create client without it
 		emptyCache = nil
+	}
+
+	// Initialize the persistent match-location index. A later, independent
+	// `match` process reads it to recover page slugs discovered by list
+	// commands. Failure is non-fatal: the client falls back to in-memory
+	// behavior and the legacy API endpoint.
+	locationIndex, indexErr := NewLocationIndex()
+	if indexErr != nil {
+		locationIndex = nil
 	}
 
 	return &Client{
@@ -68,7 +78,8 @@ func NewClient() *Client {
 		rateLimiter:   ratelimit.New(200 * time.Millisecond), // Minimal delay for concurrent requests
 		cache:         NewResponseCache(DefaultCacheConfig()),
 		emptyCache:    emptyCache,
-		pageURLs:      make(map[int]string, 50),
+		pageURLs:      make(map[int]LocationEntry, 50),
+		locationIndex: locationIndex,
 		maxConcurrent: make(chan struct{}, 10),
 	}
 }
@@ -90,13 +101,21 @@ func (c *Client) Cache() *ResponseCache {
 	return c.cache
 }
 
-// StorePageURL stores a match page URL slug for later use by MatchDetails.
-func (c *Client) StorePageURL(matchID int, pageURL string) {
-	if pageURL == "" {
+// StorePageURL stores a match page location (league ID + URL slug) in the
+// in-process map for later use by MatchDetails. Empty slugs and non-positive
+// match IDs are ignored. Persistence across processes happens through
+// PersistMatchLocations, which list commands invoke once per fetch batch.
+func (c *Client) StorePageURL(matchID int, leagueID int, pageURL string) {
+	if pageURL == "" || matchID <= 0 {
 		return
 	}
 	c.pageURLsMu.Lock()
-	c.pageURLs[matchID] = pageURL
+	c.pageURLs[matchID] = LocationEntry{
+		MatchID:   matchID,
+		LeagueID:  leagueID,
+		PageURL:   pageURL,
+		UpdatedAt: time.Now(),
+	}
 	c.pageURLsMu.Unlock()
 }
 
@@ -104,7 +123,57 @@ func (c *Client) StorePageURL(matchID int, pageURL string) {
 func (c *Client) getPageURL(matchID int) string {
 	c.pageURLsMu.RLock()
 	defer c.pageURLsMu.RUnlock()
-	return c.pageURLs[matchID]
+	return c.pageURLs[matchID].PageURL
+}
+
+// lookupLocation resolves a match's location from the in-process map first,
+// then from the persistent cross-process index. It returns false when neither
+// source knows the match.
+func (c *Client) lookupLocation(matchID int) (LocationEntry, bool) {
+	c.pageURLsMu.RLock()
+	entry, ok := c.pageURLs[matchID]
+	c.pageURLsMu.RUnlock()
+	if ok {
+		return entry, true
+	}
+	if c.locationIndex != nil {
+		return c.locationIndex.Lookup(matchID)
+	}
+	return LocationEntry{}, false
+}
+
+// PersistMatchLocations writes the page locations discovered for a batch of
+// matches into the shared on-disk index and refreshes their in-process
+// entries. Best-effort: a nil index (disk unavailable) only skips the
+// on-disk write — in-process entries are still recorded — and index write
+// errors never fail the list command that owns the data.
+func (c *Client) PersistMatchLocations(matches []api.Match) {
+	if len(matches) == 0 {
+		return
+	}
+	entries := make([]LocationEntry, 0, len(matches))
+	now := time.Now()
+	for _, m := range matches {
+		if m.ID <= 0 || m.PageURL == "" {
+			continue
+		}
+		c.StorePageURL(m.ID, m.League.ID, m.PageURL)
+		if c.locationIndex == nil {
+			continue
+		}
+		entries = append(entries, LocationEntry{
+			MatchID:   m.ID,
+			LeagueID:  m.League.ID,
+			PageURL:   m.PageURL,
+			UpdatedAt: now,
+		})
+	}
+	if c.locationIndex == nil || len(entries) == 0 {
+		return
+	}
+	if err := c.locationIndex.Upsert(entries); err != nil {
+		c.debugLog("location index: upsert failed", "err", err, "entries", len(entries))
+	}
 }
 
 // SaveEmptyCache persists the empty results cache to disk.
@@ -272,7 +341,7 @@ func (c *Client) MatchesByDateWithTabs(ctx context.Context, date time.Time, tabs
 					}
 				}
 				apiMatch := m.toAPIMatch()
-				c.StorePageURL(apiMatch.ID, apiMatch.PageURL)
+				c.StorePageURL(apiMatch.ID, apiMatch.League.ID, apiMatch.PageURL)
 				leagueMatches = append(leagueMatches, apiMatch)
 			}
 
@@ -292,6 +361,10 @@ func (c *Client) MatchesByDateWithTabs(ctx context.Context, date time.Time, tabs
 	_ = skippedFromCache
 
 	wg.Wait()
+
+	// Persist the discovered match locations in one batch so a later,
+	// independent `match` process can resolve page slugs from disk.
+	c.PersistMatchLocations(allMatches)
 
 	// Cache the results before returning
 	c.cache.SetMatches(requestDateStr, allMatches)
@@ -387,9 +460,12 @@ func (c *Client) MatchesForLeagueAndDate(ctx context.Context, leagueID int, date
 			}
 		}
 		apiMatch := m.toAPIMatch()
-		c.StorePageURL(apiMatch.ID, apiMatch.PageURL)
+		c.StorePageURL(apiMatch.ID, apiMatch.League.ID, apiMatch.PageURL)
 		matches = append(matches, apiMatch)
 	}
+
+	// Share the discovered locations with later independent processes.
+	c.PersistMatchLocations(matches)
 
 	return matches, nil
 }
@@ -397,9 +473,18 @@ func (c *Client) MatchesForLeagueAndDate(ctx context.Context, leagueID int, date
 // MatchDetails retrieves detailed information about a specific match.
 // Results are cached to avoid redundant API calls.
 //
-// Uses page-based fetching (match page HTML with __NEXT_DATA__) as the primary
-// method. FotMob removed their /api/matchDetails JSON endpoint (returns 404).
-// Falls back to the direct API endpoint if page fetching fails (unlikely to work).
+// Location resolution order:
+//  1. In-process page-slug map (same process that listed the match).
+//  2. The persistent match-location index written by `live`/`finished` in a
+//     previous, independent process.
+//  3. League-based re-location: when the stored slug no longer resolves, the
+//     known league page is re-fetched and the match's current slug is
+//     recovered from its fixtures.
+//  4. Legacy direct API endpoint as a last resort.
+//
+// Every page-derived response is identity-checked against matchID before it
+// is returned or cached: a wrong-match page or an error page can never enter
+// the details cache.
 func (c *Client) MatchDetails(ctx context.Context, matchID int) (*api.MatchDetails, error) {
 	// Check cache first
 	if cached := c.cache.Details(matchID); cached != nil {
@@ -410,23 +495,109 @@ func (c *Client) MatchDetails(ctx context.Context, matchID int) (*api.MatchDetai
 	// Apply rate limiting
 	c.rateLimiter.Wait()
 
-	// Try page-based fetching first (primary method)
-	pageSlug := c.getPageURL(matchID)
-	if pageSlug != "" {
-		c.debugLog("MatchDetails: fetching from page", "matchID", matchID, "pageSlug", pageSlug)
-		details, err := fetchMatchDetailsFromPage(ctx, c.httpClient, pageSlug)
-		if err == nil && details != nil {
+	// Resolve the location from memory or the persistent index.
+	loc, located := c.lookupLocation(matchID)
+
+	// Primary path: fetch the match page through the known slug.
+	if located && loc.PageURL != "" {
+		if details, ok := c.fetchValidatedPageDetails(ctx, matchID, loc.PageURL); ok {
 			c.cache.SetDetails(matchID, details)
 			c.debugLog("MatchDetails: page fetch success", "matchID", matchID, "events", len(details.Events))
 			return details, nil
 		}
-		c.debugLog("MatchDetails: page fetch failed, falling back to API", "matchID", matchID, "error", err)
-	} else {
-		c.debugLog("MatchDetails: no pageURL stored, falling back to API", "matchID", matchID)
+		c.debugLog("MatchDetails: stored page slug invalid, attempting relocation",
+			"matchID", matchID, "pageSlug", loc.PageURL, "leagueID", loc.LeagueID)
+	}
+
+	// Recovery path: re-discover the current slug via the known league page.
+	if located && loc.LeagueID > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("match details for match %d: %w", matchID, err)
+		}
+		if freshSlug, ok := c.relocateMatch(ctx, matchID, loc.LeagueID); ok && freshSlug != loc.PageURL {
+			if details, ok := c.fetchValidatedPageDetails(ctx, matchID, freshSlug); ok {
+				c.cache.SetDetails(matchID, details)
+				c.debugLog("MatchDetails: relocation fetch success", "matchID", matchID, "pageSlug", freshSlug)
+				return details, nil
+			}
+			c.debugLog("MatchDetails: relocated slug also failed", "matchID", matchID, "pageSlug", freshSlug)
+		}
 	}
 
 	// Fallback: direct API endpoint (likely returns 404 since FotMob removed it)
 	return c.matchDetailsFromAPI(ctx, matchID)
+}
+
+// fetchValidatedPageDetails fetches a match page and guarantees the embedded
+// details actually belong to matchID. A transport error, an HTTP error page
+// (non-200), unparseable props, or an identity mismatch all return ok=false;
+// callers must treat that as "no details" and never cache the result.
+func (c *Client) fetchValidatedPageDetails(ctx context.Context, matchID int, pageSlug string) (*api.MatchDetails, bool) {
+	details, err := fetchMatchDetailsFromPage(ctx, c.httpClient, pageSlug)
+	if err != nil {
+		c.debugLog("MatchDetails: page fetch failed", "matchID", matchID, "pageSlug", pageSlug, "error", err)
+		return nil, false
+	}
+	if details == nil || details.ID != matchID {
+		got := 0
+		if details != nil {
+			got = details.ID
+		}
+		c.debugLog("MatchDetails: page identity mismatch, refusing result",
+			"matchID", matchID, "returnedID", got, "pageSlug", pageSlug)
+		return nil, false
+	}
+	return details, true
+}
+
+// relocateMatch re-fetches the league page (bypassing the short-TTL page
+// cache, which may itself carry the stale slug) and extracts the match's
+// current page slug. On success the in-process map and the persistent index
+// are repaired so subsequent calls — including in other processes — use the
+// fresh slug without relocating again.
+func (c *Client) relocateMatch(ctx context.Context, matchID int, leagueID int) (string, bool) {
+	body, err := fetchLeagueFromPage(ctx, c.httpClient, leagueID)
+	if err != nil {
+		c.debugLog("MatchDetails: relocation league fetch failed", "matchID", matchID, "leagueID", leagueID, "error", err)
+		return "", false
+	}
+	// Refresh the cached league body with the fresh response.
+	c.cache.SetPage(leagueID, body)
+
+	var leagueResponse struct {
+		Fixtures struct {
+			AllMatches []fotmobMatch `json:"allMatches"`
+		} `json:"fixtures"`
+	}
+	if err := json.Unmarshal(body, &leagueResponse); err != nil {
+		c.debugLog("MatchDetails: relocation decode failed", "matchID", matchID, "error", err)
+		return "", false
+	}
+
+	for _, m := range leagueResponse.Fixtures.AllMatches {
+		if parseInt(m.ID) != matchID {
+			continue
+		}
+		apiMatch := m.toAPIMatch()
+		if apiMatch.PageURL == "" {
+			return "", false
+		}
+		c.StorePageURL(matchID, leagueID, apiMatch.PageURL)
+		if c.locationIndex != nil {
+			if err := c.locationIndex.Upsert([]LocationEntry{{
+				MatchID:   matchID,
+				LeagueID:  leagueID,
+				PageURL:   apiMatch.PageURL,
+				UpdatedAt: time.Now(),
+			}}); err != nil {
+				c.debugLog("location index: relocation upsert failed", "err", err)
+			}
+		}
+		return apiMatch.PageURL, true
+	}
+
+	c.debugLog("MatchDetails: match not found in league fixtures", "matchID", matchID, "leagueID", leagueID)
+	return "", false
 }
 
 // matchDetailsFromAPI fetches match details from the /api/matchDetails endpoint.

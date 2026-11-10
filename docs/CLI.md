@@ -14,14 +14,14 @@ Use this tool when the user asks about football (soccer) matches. Map their ques
 | Today's results (already finished) | `golazo finished --days 1` |
 | Today's full slate (finished + still-to-come) | `golazo finished --include-upcoming` |
 | Results over the last N days (≤7) | `golazo finished --days N` |
-| Details for a specific match (events, lineups, stats) | `golazo match <id>` — **best-effort only**, see [Known limitations](#known-limitations) |
+| Details for a specific match (events, lineups, stats) | `golazo match <id>` — reliable for IDs discovered by `live`/`finished`, see [Match details across processes](#match-details-across-processes) |
 | Which competitions are tracked / what league IDs exist | `golazo leagues` (or `--all`) |
 
 If the user's question doesn't map to one of the above, this tool likely cannot answer it. Golazo does not expose: standings/tables, head-to-head history, individual player stats, transfer news, or fixtures beyond today.
 
 ## Quick start (worked example)
 
-The reliable agent flow is **discover → list**. Stop at the list level — `live` and `finished` already return all the per-match metadata an agent typically needs (teams, score, status, kickoff time, league). Drilling into `match <id>` is best-effort only and not recommended for one-shot pipelines (see [Known limitations](#known-limitations)).
+The reliable agent flow is **discover → detail**. `live` and `finished` return all the per-match metadata an agent typically needs (teams, score, status, kickoff time, league, round), and every discovered match's location is persisted to disk, so a follow-up `golazo match <id>` in a separate process resolves the same match page reliably (see [Match details across processes](#match-details-across-processes)).
 
 ```bash
 # 0. (Optional but recommended) Self-discover the CLI contract
@@ -41,11 +41,11 @@ golazo finished --include-upcoming | jq '.data[] | {
 }'
 ```
 
-For events / lineups / stats: use `golazo match <id> --mock` against the bundled mock IDs (2001, 2002, ...) to validate your jq pipeline, then accept that against real IDs the call is best-effort.
+For events / lineups / stats: run `golazo live` or `golazo finished` first to discover and persist match IDs, then call `golazo match <id>`. To validate your jq pipeline without any network, use `--mock` with the bundled mock IDs (2001, 2002, ...).
 
 ## Subcommands
 
-> **⚠ Important for agents using `match <id>`:** this subcommand is **best-effort only**. Cold calls with arbitrary IDs typically return `upstream_error` (HTTP 404) due to a FotMob slug-cache constraint that cannot be satisfied by a one-shot CLI invocation. Reliable only with `--mock` (bundled mock IDs) or from inside the interactive TUI. For agentic use, treat the list endpoints (`live`, `finished`) as the authoritative source — they already include teams, score, status, league and kickoff time. See [Known limitations](#known-limitations) for the full explanation.
+> **Agent note for `match <id>`:** call `live` or `finished` first — each discovered match's ID, league, and page path is persisted to a shared on-disk index, so a later `match <id>` invocation (even in a separate process) resolves the match page directly. Stale page paths are repaired automatically via the known league. Only arbitrary IDs never seen by a list command still hit the legacy API fallback and may return `upstream_error`. See [Match details across processes](#match-details-across-processes) for the full contract.
 
 | Command | Description |
 |---|---|
@@ -137,9 +137,9 @@ match_time:  string     # RFC3339 timestamp in UTC, e.g. "2026-06-12T19:00:00Z"
 live_time:   string|null # null unless status == "live"; e.g. "45+2", "HT", "67'"
 round:       string     # e.g. "Matchday 17", "Round of 16"
 page_url:    string     # FotMob page slug, e.g. "/matches/team-a-vs-team-b/abc123".
-                        # This is the slug the CLI would need to fetch full
-                        # match details reliably. Exposed for transparency;
-                        # not consumed by any current subcommand.
+                        # Persisted alongside match_id and league to the shared
+                        # match-locations index so a later `golazo match <id>`
+                        # process can fetch the match page without re-discovery.
 ```
 
 ### `MatchDetails` (returned by `match`)
@@ -257,7 +257,7 @@ golazo finished --days 3 --pretty
 # Today's full slate (finished + still-to-come)
 golazo finished --include-upcoming
 
-# Single match details (best-effort; reliable only against mock IDs)
+# Single match details (use an ID discovered by live/finished; --mock works offline)
 golazo match 2001 --mock
 
 # Discover league IDs to interpret results
@@ -289,7 +289,7 @@ golazo finished --days 3 | jq -r '.data[].id'
 # Check whether the result was degraded (partial-failure-aware retry decision)
 golazo finished --days 7 | jq '{ok: ((.degraded // false) | not), failed: (.failed_dates // [])}'
 
-# Goal events only, ordered by minute (best-effort; mock ID example)
+# Goal events only, ordered by minute (mock ID example)
 golazo match 2001 --mock \
   | jq '.data[0].events | map(select(.type == "goal")) | sort_by(.minute)'
 ```
@@ -309,7 +309,7 @@ Use this table to decide whether to retry, fix the call, or give up.
 | `invalid_args` | `2` | Bad flag value (e.g. `--days 99`, non-numeric match ID) | **No** — fix the call. Retrying will keep failing. |
 | `not_found` | `3` | Unknown match ID (mock mode), or match has no data | **No** — pick a fresh ID via a list call. |
 | `timeout` | `4` | Upstream slow or network congested | **Yes**, with a larger `--timeout` (e.g. `--timeout 30s`). |
-| `upstream_error` | `1` | FotMob 4xx/5xx, network failure, Cloudflare challenge | **Once** — transient errors recover. For `match <id>`, do not retry on 404: cold calls are expected to fail (see [Known limitations](#known-limitations)). |
+| `upstream_error` | `1` | FotMob 4xx/5xx, network failure, Cloudflare challenge | **Once** — transient errors recover. For `match <id>` on an ID never discovered by `live`/`finished`, a 404 from the legacy fallback is expected; run a list command first (see [Match details across processes](#match-details-across-processes)). |
 | `offline` | `5` | `GOLAZO_OFFLINE=1` is set | **No** — unset the env var, or pass `--mock` for synthetic data. |
 
 The exit code is the most reliable retry signal. The `code` field in the error envelope on stderr says the same thing in machine-readable form; agents should prefer the exit code (no JSON parsing required).
@@ -331,21 +331,34 @@ Conversely, partial failures (`finished` over multiple days where some days fetc
 
 Golazo internally rate-limits FotMob requests to one every 200ms and caps concurrent requests at 10. Agents calling subcommands in tight loops will not be rejected — requests just queue. There is **no** explicit `rate_limited` error code today. If FotMob itself rate-limits the underlying client, that surfaces as `upstream_error`.
 
+## Match details across processes
 
+`live` and `finished` discover every match's page path (the FotMob match-page slug) while parsing league pages. Those locations were previously held only in the client's in-memory map, so a later one-shot `golazo match <id>` process started cold and fell back to a removed API endpoint. Golazo now persists the location contract to disk.
 
-### `match <id>` is best-effort only
+### The on-disk location index
 
-FotMob's match-details endpoint is gated behind Cloudflare Turnstile when called directly. Golazo's primary fetch path retrieves details by parsing the match's page HTML using a slug that is only populated **inside a long-running process** (the interactive TUI). A one-shot CLI invocation never has the slug cache populated, so `golazo match <id>` against a real ID typically returns `upstream_error` (HTTP 404 from the API fallback).
+- **File:** `match-locations.json` in the golazo config directory (`~/.golazo/` on macOS/Linux, `%APPDATA%\golazo` on Windows).
+- **Record:** `match_id`, `league_id`, `page_url` (page path), and an `updated_at` timestamp.
+- **Bound:** at most 500 entries; the least recently updated records are evicted first, and records expire after 30 days.
+- **Durability:** writes go through a temp file plus atomic rename, so readers — including other processes — never see a half-written file. Concurrent writers serialize per path and reload-merge before writing, so one process cannot erase another process's records. A corrupted file degrades to an empty index and is repaired on the next write; one malformed record never invalidates the others.
 
-**What this means for agents**:
+### Resolution order for `golazo match <id>`
 
-- `golazo match <id>` is **not** a dependable building block for production agent pipelines.
-- Treat `live` and `finished` as the authoritative agent-facing endpoints. Both already include teams, scores, status, league, kickoff time, round, and `page_url` — enough to answer most match-level questions without needing `match`.
-- For **testing** your jq pipeline against match details, use `--mock` with the bundled mock IDs (e.g. `golazo match 2001 --mock`). The mock data exposes the full `MatchDetails` shape (events, lineups, stats, formations).
-- For **human / interactive** access to a specific match, use the TUI (`golazo`, no subcommand) and select the match.
+1. **In-process slug map** — populated when the same process listed the match (the interactive TUI path).
+2. **Persistent location index** — cold-start read of the match's stored page path.
+3. **League re-location** — if the stored path returns an error page, the client re-fetches the known league page, extracts the match's current page path from its fixtures, repairs both the in-memory map and the on-disk index, and retries.
+4. **Legacy API fallback** — only for IDs never discovered by a list command; this endpoint is removed upstream and typically returns 404.
 
-We chose not to work around this limitation in the CLI: persisting the slug cache to disk would add complexity and a new failure mode, and FotMob's gating may change at any time. The `page_url` field on every `Match` is the slug FotMob uses; documented here in case future versions of the CLI accept it as an explicit input.
+### Identity and cache safety
 
-### Debug logging is sparse on list endpoints
+Every page-derived response is checked against the requested match ID before it is returned or cached. A non-200 error page, unparseable props, or a 200 page whose embedded match differs from the requested ID is rejected and never enters the details cache; the call then proceeds to re-location or the API fallback.
+
+### What this means for agents
+
+- The reliable flow remains **discover → detail**: `golazo live` or `golazo finished` first, then `golazo match <id>` — even in a separate OS process, minutes later.
+- `--mock` stays fully hermetic and works offline with the bundled mock IDs (e.g. `golazo match 2001 --mock`).
+- Arbitrary IDs that no list command has ever seen cannot be located and still rely on the legacy fallback.
+
+## Debug logging is sparse on list endpoints
 
 `--debug` and `GOLAZO_AGENT=1` only emit logs at the FotMob client's match-details fetch path. The list endpoints (`live`, `finished`, `leagues`) are largely silent. This is by design — agents are expected to interpret the JSON envelope (including `degraded` / `failed_dates`), not stderr logs.

@@ -20,7 +20,7 @@ func newTestClient(baseURL string) *Client {
 		baseURL:       baseURL,
 		rateLimiter:   ratelimit.New(0), // no delay in tests
 		cache:         NewResponseCache(DefaultCacheConfig()),
-		pageURLs:      make(map[int]string, 10),
+		pageURLs:      make(map[int]LocationEntry, 10),
 		maxConcurrent: make(chan struct{}, 10),
 	}
 }
@@ -194,17 +194,26 @@ func TestMatchDetails_ContextCancelled(t *testing.T) {
 func TestStoreAndGetPageURL(t *testing.T) {
 	client := newTestClient("http://unused")
 
-	client.StorePageURL(123, "/matches/a-vs-b/slug")
+	client.StorePageURL(123, 47, "/matches/a-vs-b/slug")
 	got := client.getPageURL(123)
 	if got != "/matches/a-vs-b/slug" {
 		t.Errorf("getPageURL(123) = %q, want /matches/a-vs-b/slug", got)
 	}
+	if loc, ok := client.lookupLocation(123); !ok || loc.LeagueID != 47 {
+		t.Errorf("lookupLocation(123) = %+v, ok=%v, want leagueID 47", loc, ok)
+	}
 
 	// Empty URL should not be stored.
-	client.StorePageURL(456, "")
+	client.StorePageURL(456, 47, "")
 	got = client.getPageURL(456)
 	if got != "" {
 		t.Errorf("getPageURL(456) = %q, want empty (should not store empty)", got)
+	}
+
+	// Non-positive IDs should not be stored.
+	client.StorePageURL(0, 47, "/matches/a-vs-b/zero")
+	if got = client.getPageURL(0); got != "" {
+		t.Errorf("getPageURL(0) = %q, want empty (non-positive IDs rejected)", got)
 	}
 
 	// Missing key returns empty.

@@ -88,7 +88,7 @@ func buildCapabilities() capabilities {
 			},
 			{
 				Name:        "match",
-				Description: "Get full match details (events, lineups, stats). BEST-EFFORT ONLY — cold calls against arbitrary IDs typically fail with upstream_error due to a FotMob slug-cache constraint. Reliable only with --mock or from the TUI. Not recommended for production agent pipelines.",
+				Description: "Get full match details (events, lineups, stats) for a match ID. IDs previously discovered by live/finished resolve through a persistent on-disk location index shared across processes, with automatic re-location via the known league when a page path goes stale. Arbitrary unseen IDs still fall back to the legacy FotMob API and may return upstream_error; --mock always works.",
 				Args:        "<id>",
 				Flags:       commonFlags,
 				Example:     "golazo match 2001 --mock",
@@ -129,8 +129,8 @@ func buildCapabilities() capabilities {
 			EnvOffline: "Refuses any network call; subcommands return offline unless --mock is set",
 		},
 		Envelope: map[string]any{
-			"success":  map[string]any{"status": "ok", "count": "int", "data": "[]object", "degraded": "bool (optional)", "failed_dates": "[]string (optional)"},
-			"error":    map[string]any{"status": "error", "code": "string", "message": "string"},
+			"success": map[string]any{"status": "ok", "count": "int", "data": "[]object", "degraded": "bool (optional)", "failed_dates": "[]string (optional)"},
+			"error":   map[string]any{"status": "error", "code": "string", "message": "string"},
 			"notes": []string{
 				"Errors always go to stderr; stdout stays empty on error.",
 				"Single-item responses (match <id>) still use a data array with count: 1.",

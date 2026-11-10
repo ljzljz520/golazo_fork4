@@ -101,7 +101,7 @@ golazo capabilities | jq .                       # self-discover the contract
 golazo live                                       # live matches right now
 golazo finished --include-upcoming                # today's full slate
 golazo finished --days 3                          # last 3 days
-golazo match 2001 --mock                          # full match details (best-effort against real IDs; reliable with --mock)
+golazo match 2001 --mock                          # full match details (real IDs work after live/finished; --mock is offline)
 golazo leagues --all                              # every supported league
 ```
 

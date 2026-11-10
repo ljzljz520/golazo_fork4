@@ -51,7 +51,7 @@ func pageCacheTestClient(t *testing.T, ttl time.Duration) (*Client, *atomic.Int3
 		baseURL:       baseURL,
 		rateLimiter:   ratelimit.New(0),
 		cache:         NewResponseCache(cfg),
-		pageURLs:      make(map[int]string, 10),
+		pageURLs:      make(map[int]LocationEntry, 10),
 		maxConcurrent: make(chan struct{}, 10),
 	}
 	return client, &hits

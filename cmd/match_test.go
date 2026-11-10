@@ -74,3 +74,71 @@ func TestRunMatch_MockKnownIDReturnsDetails(t *testing.T) {
 		t.Errorf("data[0].ID = %d, want 2001", env.Data[0].ID)
 	}
 }
+
+// TestRunMatch_OfflineEnvWritesErrorToStderr preserves the existing offline
+// contract: GOLAZO_OFFLINE=1 refuses network access before any client work,
+// regardless of the new location-index machinery.
+func TestRunMatch_OfflineEnvWritesErrorToStderr(t *testing.T) {
+	t.Setenv(EnvOffline, "1")
+
+	var stdout, stderr bytes.Buffer
+	code := runMatch(&stdout, &stderr, cliFlags{mock: false, timeout: time.Second}, []string{"12345"})
+
+	if code != ExitOffline {
+		t.Errorf("exit code = %d, want %d", code, ExitOffline)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout should be empty on offline error, got: %s", stdout.String())
+	}
+	var env errEnvelope
+	if err := json.Unmarshal(stderr.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal stderr: %v\nraw: %s", err, stderr.String())
+	}
+	if env.Code != ErrCodeOffline {
+		t.Errorf("error code = %q, want %q", env.Code, ErrCodeOffline)
+	}
+}
+
+// TestRunMatch_TimeoutReportsTimeout ensures a deadline exceeded while
+// resolving match details surfaces as the documented timeout envelope rather
+// than a generic upstream error or a phantom empty success.
+func TestRunMatch_TimeoutReportsTimeout(t *testing.T) {
+	t.Setenv(EnvOffline, "")
+	t.Setenv(EnvAgent, "")
+
+	// 1ns timeout: the headless client context is deadline-exceeded before
+	// the first HTTP call. The page/API fetch paths must propagate it and
+	// the CLI maps it to ErrCodeTimeout.
+	var stdout, stderr bytes.Buffer
+	code := runMatch(&stdout, &stderr, cliFlags{mock: false, timeout: 1}, []string{"12345"})
+
+	if code != ExitTimeout {
+		t.Errorf("exit = %d, want %d (stderr=%s, stdout=%s)", code, ExitTimeout, stderr.String(), stdout.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout should be empty on timeout, got: %s", stdout.String())
+	}
+	var env errEnvelope
+	if err := json.Unmarshal(stderr.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal stderr: %v\nraw: %s", err, stderr.String())
+	}
+	if env.Code != ErrCodeTimeout {
+		t.Errorf("error code = %q, want %q", env.Code, ErrCodeTimeout)
+	}
+}
+
+// TestRunMatch_OfflineMockStillServed confirms mock mode remains hermetic and
+// keeps working under GOLAZO_OFFLINE (no index or network involvement).
+func TestRunMatch_OfflineMockStillServed(t *testing.T) {
+	t.Setenv(EnvOffline, "1")
+
+	var stdout, stderr bytes.Buffer
+	code := runMatch(&stdout, &stderr, cliFlags{mock: true, timeout: time.Second}, []string{"2001"})
+
+	if code != ExitOK {
+		t.Fatalf("exit = %d, want %d. stderr=%s", code, ExitOK, stderr.String())
+	}
+	if stdout.Len() == 0 {
+		t.Error("stdout empty under offline+mock")
+	}
+}
